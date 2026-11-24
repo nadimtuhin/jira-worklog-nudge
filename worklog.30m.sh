@@ -3,6 +3,7 @@ set -uo pipefail
 export PATH=/opt/homebrew/bin:/usr/local/bin:/usr/bin:/bin
 
 CONFIG="${JIRA_WORKLOG_NUDGE_CONFIG:-$HOME/.config/jira-worklog-nudge/config.env}"
+# shellcheck source=config.env.example
 [ -f "$CONFIG" ] && . "$CONFIG"
 
 : "${JIRA_SITE:=}"
@@ -43,13 +44,19 @@ start_of_today() { date '+%Y-%m-%dT00:00:00%z'; }
 
 epoch_of() { date -j -f '%Y-%m-%dT%H:%M:%S%z' "$1" +%s 2>/dev/null; }
 
+# Latest end (started + timeSpentSeconds) over all slices, compared as epochs so a
+# long early slice beats a short later one and mixed UTC offsets sort correctly.
 slice_end() {
-  local slices=$1 best e
+  local slices=$1 started secs e best=""
   echo "$slices" | grep -q TRUNCATED && { epoch_of "$(start_of_today)"; return; }
-  best=$(echo "$slices" | sort | tail -1)
-  [ -z "$best" ] && { epoch_of "$(start_of_today)"; return; }
-  e=$(epoch_of "${best% *}")
-  if [ -z "$e" ]; then epoch_of "$(start_of_today)"; else echo $(( e + ${best##* } )); fi
+  while read -r started secs; do
+    [ -z "$started" ] && continue
+    e=$(epoch_of "$started") || continue
+    [ -z "$e" ] && continue
+    e=$(( e + ${secs:-0} ))
+    if [ -z "$best" ] || [ "$e" -gt "$best" ]; then best=$e; fi
+  done <<< "$slices"
+  if [ -z "$best" ]; then epoch_of "$(start_of_today)"; else echo "$best"; fi
 }
 
 logged_on() { echo "$1" | awk -v d="$2" 'index($1,d)==1 {t+=$2} END{print t+0}'; }
@@ -91,7 +98,7 @@ tidy() { sed -E 's/^\[[A-Za-z]+\] *//; s/ *\[[0-9]+(\.[0-9]+)?h\] *$//'; }
 open_url() { echo "/usr/bin/open"; }
 
 log_target() {
-  if [ -n "$LOG_COMMAND" ]; then echo "$LOG_COMMAND"; else echo "$(open_url)"; fi
+  if [ -n "$LOG_COMMAND" ]; then echo "$LOG_COMMAND"; else open_url; fi
 }
 
 log_param() {
@@ -134,10 +141,16 @@ menu_controls() {
   echo "Quit SwiftBar | bash=/usr/bin/killall param1=SwiftBar terminal=false"
 }
 
-render() {
-  local end=$1 logged=$2 cands=$3 days=${4:-} sprint=${5:-} elapsed sessions key summary day_start
+# Never count back past WORKDAY_START today: a gap that began last night starts at 09:00.
+clamp_end() {
+  local end=$1 day_start
   day_start=$(date -j -f '%Y-%m-%d %H:%M' "$(date +%Y-%m-%d) $WORKDAY_START" +%s 2>/dev/null)
-  [ -n "$day_start" ] && [ "$end" -lt "$day_start" ] && end=$day_start
+  if [ -n "$day_start" ] && [ "$end" -lt "$day_start" ]; then echo "$day_start"; else echo "$end"; fi
+}
+
+render() {
+  local end logged=$2 cands=$3 days=${4:-} sprint=${5:-} elapsed key summary
+  end=$(clamp_end "$1")
   elapsed=$(( $(date +%s) - end ))
   [ "$elapsed" -lt 0 ] && elapsed=0
   if [ "$logged" -ge "$DAILY_TARGET_SECONDS" ] || [ "$elapsed" -lt "$NUDGE_AFTER_SECONDS" ]; then
@@ -172,17 +185,29 @@ render() {
 }
 
 refresh_cache() {
-  local end logged cands days sprint slices
+  local end logged cands days sprint slices tmp lock="$STATE_DIR/refresh.lock"
+  # One fan-out at a time; a lock older than 10 minutes is from a killed run.
+  find "$lock" -maxdepth 0 -mmin +10 -exec rmdir {} \; 2>/dev/null
+  mkdir "$lock" 2>/dev/null || return 0
   slices=$(all_slices)
   end=$(slice_end "$slices")
   logged=$(logged_on "$slices" "$(date +%Y-%m-%d)")
   cands=$(candidates)
   days=$(day_totals_from "$slices")
   sprint=$(sprint_window "$(echo "$cands" | head -1 | cut -f1)")
-  [ -n "$end" ] && [ -n "$cands" ] && \
-    jq -n --arg end "$end" --arg logged "$logged" --arg cands "$cands" \
-      --arg days "$days" --arg sprint "$sprint" \
-      '{end:$end,logged:$logged,cands:$cands,days:$days,sprint:$sprint}' > "$CACHE" 2>/dev/null
+  # Write beside the cache and rename, so a failed write never truncates the last
+  # good cache and a concurrent render never reads half a file.
+  if [ -n "$end" ] && [ -n "$cands" ] && tmp=$(mktemp "$STATE_DIR/cache.XXXXXX"); then
+    if jq -n --arg end "$end" --arg logged "$logged" --arg cands "$cands" \
+         --arg days "$days" --arg sprint "$sprint" \
+         '{end:$end,logged:$logged,cands:$cands,days:$days,sprint:$sprint}' > "$tmp" 2>/dev/null; then
+      mv -f "$tmp" "$CACHE"
+    else
+      rm -f "$tmp"
+    fi
+  fi
+  rmdir "$lock" 2>/dev/null
+  return 0
 }
 
 if [ "${1:-}" = "--refresh" ]; then
@@ -210,7 +235,7 @@ logged=$(jq -r '.logged' "$CACHE")
 render "$end" "$logged" "$(jq -r '.cands' "$CACHE")" \
   "$(jq -r '.days // ""' "$CACHE")" "$(jq -r '.sprint // ""' "$CACHE")"
 
-if should_alert $(( $(date +%s) - end )) "$logged"; then
+if should_alert $(( $(date +%s) - $(clamp_end "$end") )) "$logged"; then
   /usr/bin/osascript -e 'display notification "Nothing logged for '"$ALERT_AFTER_HOURS"'h" with title "Worklog nudge"' >/dev/null 2>&1
 fi
 

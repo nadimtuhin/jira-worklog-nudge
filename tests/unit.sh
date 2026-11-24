@@ -1,11 +1,21 @@
 #!/bin/bash
+# Variables assigned here are read by the sourced plugin functions.
+# shellcheck disable=SC2034
 S="$(dirname "$0")/../worklog.30m.sh"
 fail=0
 ok(){ echo "PASS $1"; }
 no(){ echo "FAIL $1: $2"; fail=1; }
 
+# Keep the run hermetic: never read the developer's real config or state dir.
+export JIRA_WORKLOG_NUDGE_CONFIG=/dev/null
+STATE_DIR=$(mktemp -d); export STATE_DIR
+tmp=$(mktemp)
+trap 'rm -rf "$STATE_DIR" "$tmp"' EXIT
+
 # unit: source funcs without running main
-tmp=/tmp/funcs.sh; sed -n '1,/^if \[ "\${1:-}" = "--refresh" \]/p' "$S" | sed '$d' > $tmp; . $tmp; set +o pipefail
+sed -n '1,/^if \[ "\${1:-}" = "--refresh" \]/p' "$S" | sed '$d' > "$tmp"
+# shellcheck source=/dev/null
+. "$tmp"; set +o pipefail
 
 [ "$(hhmm 7920)" = "2h12" ] && ok hhmm || no hhmm "got $(hhmm 7920)"
 [ "$(hhmm 0)" = "0h00" ] && ok hhmm-zero || no hhmm-zero "got $(hhmm 0)"
@@ -41,7 +51,7 @@ yesterday_evening=$(( ds - 16 * 3600 ))
 render "$yesterday_evening" 0 $'BX-1\tx\t0\t0' | grep -q 'unlogged since 09:00' && ok clamp-label || no clamp-label "label not clamped"
 [ "$(render $(( $(date +%s) - 600 )) 0 $'BX-1\tx\t0\t0' | head -1)" = "⏱ | color=#808080" ] && ok no-clamp-today || no no-clamp-today "clamped a same-day slice"
 
-y=$(date -v-1d +%Y-%m-%d); t=$(date +%Y-%m-%d)
+y=$(date -v-1d +%Y-%m-%d)
 ds=$(printf '%s\t3600\n' "$y")
 o2=$(day_submenu "Last 2" "$y" "$ds")
 [ "$(echo "$o2" | head -1)" = "Last 2 — 1h over 2 days" ] && ok daysub-header || no daysub-header "$(echo "$o2"|head -1)"
@@ -53,8 +63,6 @@ echo "$o" | grep -E '^BX-1 ' | grep -qE 'param1=[^ ]+ terminal=false$' && ok par
 
 
 
-export STATE_DIR=/tmp/wn-test-state
-rm -rf "$STATE_DIR"; mkdir -p "$STATE_DIR"
 ALERTS="$STATE_DIR/alerts-$(date +%Y-%m-%d)"
 ALERT_AFTER_SECONDS=10800; ALERT_MAX_PER_DAY=3; ALERT_LAST_HOUR=23; DAILY_TARGET_SECONDS=18000
 
@@ -65,7 +73,46 @@ should_alert 20000 0 && no alert-throttled "fired twice in a row" || ok alert-th
 printf '1 0\n' > "$ALERTS"; should_alert 20000 0 && ok alert-second || no alert-second "blocked"
 printf '3 0\n' > "$ALERTS"; should_alert 20000 0 && no alert-daily-cap "exceeded 3/day" || ok alert-daily-cap
 printf '0 0\n' > "$ALERTS"; ALERT_LAST_HOUR=0; should_alert 20000 0 && no alert-after-hours "fired past cutoff" || ok alert-after-hours
-rm -rf "$STATE_DIR"
+rm -f "$ALERTS"
+
+# slice_end: the last *ending* slice wins, not the last *starting* one
+s1=$'2026-08-28T09:00:00+0600 14400\n2026-08-28T10:00:00+0600 1800'
+[ "$(slice_end "$s1")" = "$(( $(epoch_of 2026-08-28T09:00:00+0600) + 14400 ))" ] && ok slice-end-longest || no slice-end-longest "got $(slice_end "$s1")"
+# slice_end: offsets are compared as instants, not as strings (15:00+0600 is 09:00Z, before 12:00Z)
+s2=$'2026-08-28T12:00:00+0000 600\n2026-08-28T15:00:00+0600 600'
+[ "$(slice_end "$s2")" = "$(( $(epoch_of 2026-08-28T12:00:00+0000) + 600 ))" ] && ok slice-end-tz || no slice-end-tz "got $(slice_end "$s2")"
+
+# refresh_cache: a failed write must not clobber the last good cache
+all_slices() { printf '%s 3600\n' "$(date '+%Y-%m-%dT10:00:00%z')"; }
+candidates() { printf 'BX-1\tx\t0\t0\n'; }
+sprint_window() { :; }
+echo '{"end":"1","logged":"0","cands":"BX-9\tkeep"}' > "$CACHE"
+jq() { printf '{"end":'; return 1; }
+refresh_cache
+unset -f jq
+[ "$(jq -r .cands "$CACHE" 2>/dev/null)" = $'BX-9\tkeep' ] && ok cache-atomic || no cache-atomic "cache is now: $(cat "$CACHE")"
+refresh_cache
+[ "$(jq -r .cands "$CACHE" 2>/dev/null)" = $'BX-1\tx\t0\t0' ] && ok cache-written || no cache-written "cache is now: $(cat "$CACHE")"
+
+# refresh_cache: a second refresh while one is running does not start another fan-out
+mkdir -p "$STATE_DIR/refresh.lock"
+all_slices() { touch "$STATE_DIR/fanout-ran"; }
+refresh_cache
+[ ! -e "$STATE_DIR/fanout-ran" ] && ok refresh-lock || no refresh-lock "second fan-out started while locked"
+rm -rf "$STATE_DIR/refresh.lock" "$STATE_DIR/fanout-ran"
+refresh_cache
+[ -e "$STATE_DIR/fanout-ran" ] && [ ! -d "$STATE_DIR/refresh.lock" ] && ok refresh-unlocks || no refresh-unlocks "did not run or left the lock behind"
+
+# main: the notification uses the same workday clamp as the title.
+# Last slice ended yesterday evening, the workday started just now: no alert.
+P=$(mktemp -d)
+cfg="$P/config.env"
+printf 'JIRA_SITE=x.atlassian.net\nJIRA_EMAIL=me@x\nWORKDAY_START=%s\nALERT_LAST_HOUR=23\nSTATE_DIR=%s\n' "$(date +%H:%M)" "$P" > "$cfg"
+printf '{"end":"%s","logged":"0","cands":"BX-1\\tx\\t0\\t0"}' $(( $(date +%s) - 20 * 3600 )) > "$P/cache.json"
+JIRA_WORKLOG_NUDGE_CONFIG="$cfg" bash "$S" > "$P/out" 2>/dev/null
+head -1 "$P/out" | grep -q '^⏱ | color' && ok morning-title-quiet || no morning-title-quiet "$(head -1 "$P/out")"
+[ ! -e "$P/alerts-$(date +%Y-%m-%d)" ] && ok morning-no-alert || no morning-no-alert "notified about overnight gap"
+sleep 1; rm -rf "$P"
 
 I="$(dirname "$0")/../install.sh"
 bash -n "$I" && ok installer-syntax || no installer-syntax "syntax error"
